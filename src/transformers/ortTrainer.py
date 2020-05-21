@@ -1,4 +1,5 @@
 import json
+import time
 import logging
 import os
 import random
@@ -16,13 +17,20 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler
 from tqdm import tqdm, trange
+import horovod.torch as hvd
+
+from onnxruntime.capi.ort_trainer import ORTTrainer, IODescription, ModelDescription
+from onnxruntime.capi.ort_trainer import LossScaler
 
 from .data.data_collator import DataCollator, DefaultDataCollator
 from .modeling_utils import PreTrainedModel
-from .optimization import AdamW, get_linear_schedule_with_warmup
+from .optimization_ort import linear_schedule_with_warmup
 from .training_args import TrainingArguments
 from .configuration_auto import AutoConfig
 
+from azureml.core.run import Run
+# get the Azure ML run object
+run = Run.get_context()
 
 try:
     from apex import amp
@@ -69,11 +77,8 @@ def torch_distributed_zero_first(local_rank: int):
     """
     Decorator to make all processes in distributed training wait for the first one (locally) to do something.
     """
-    if local_rank not in [-1, 0]:
-        torch.distributed.barrier()
     yield
-    if local_rank == 0:
-        torch.distributed.barrier()
+
 
 class EvalPrediction(NamedTuple):
     """
@@ -96,10 +101,10 @@ class TrainOutput(NamedTuple):
     training_loss: float
 
 
-PREFIX_CHECKPOINT_DIR = "checkpoint"
+PREFIX_CHECKPOINT_DIR = "ort_checkpoint"
 
 
-class Trainer:
+class OrtTrainer:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch,
     optimized for Transformers.
@@ -115,6 +120,7 @@ class Trainer:
     tb_writer: Optional["SummaryWriter"] = None
     config: Optional[AutoConfig] = None
 
+
     def __init__(
         self,
         model: PreTrainedModel,
@@ -125,7 +131,7 @@ class Trainer:
         compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
         prediction_loss_only=False,
         config: Optional[AutoConfig] = None,
-    ):
+        ):
         """
         Trainer is a simple but feature-complete training and eval loop for PyTorch,
         optimized for Transformers.
@@ -144,6 +150,7 @@ class Trainer:
         self.eval_dataset = eval_dataset
         self.compute_metrics = compute_metrics
         self.prediction_loss_only = prediction_loss_only
+
         if is_tensorboard_available() and self.args.local_rank in [-1, 0]:
             self.tb_writer = SummaryWriter(log_dir=self.args.logging_dir)
         if not is_tensorboard_available():
@@ -154,16 +161,90 @@ class Trainer:
         # Create output directory if needed
         if self.args.local_rank in [-1, 0]:
             os.makedirs(self.args.output_dir, exist_ok=True)
+        
+        torch.cuda.set_device(self.args.local_rank)
+
+        self.ort_model = self.to_ort_model(model, config, args)
+
+    def gpt2_model_description(self,n_head, vocab_size, n_hidden, n_layer, n_ctx, batch_size):
+    
+        logger.info("****num of head is: {}".format(n_head))
+        logger.info("****vocab size is: {}".format(vocab_size))
+        logger.info("****num of hidden layer is: {}".format(n_hidden))
+        logger.info("****num of layer is: {}".format(n_layer))
+        logger.info("****seq length is: {}".format(n_ctx))
+
+        input_ids_desc = IODescription('input_ids', [batch_size, n_ctx], torch.int64, num_classes = vocab_size)    
+        labels_desc = IODescription('labels', [batch_size, n_ctx], torch.int64, num_classes = vocab_size)
+        
+        loss_desc = IODescription('loss', [], torch.float32)
+        
+        return ModelDescription([input_ids_desc, labels_desc],
+                                [loss_desc])
+
+    def ort_trainer_learning_rate_description(self):
+        return IODescription('Learning_Rate', [1,], torch.float32)
+
+    def to_ort_model(self,model, config, args):
+        # set GPU memory limitation
+        from onnxruntime.capi._pybind_state import set_cuda_mem_limit
+        ort_cuda_mem_limit_in_gbs = 15
+        set_cuda_mem_limit(int(ort_cuda_mem_limit_in_gbs * 1024 * 1024 *1024))
+
+        # model_desc = gpt2_model_description(12, 50257, 1024, 6, 1024)
+        model_desc = self.gpt2_model_description(config.n_head, config.vocab_size, config.n_embd, config.n_layer, config.n_ctx, args.per_gpu_train_batch_size)
+        learning_rate_description = self.ort_trainer_learning_rate_description()
+
+        def map_optimizer_attributes(name):
+            no_decay_keys = ["bias", "gamma", "beta", "LayerNorm"]
+            no_decay = False
+            for no_decay_key in no_decay_keys:
+                if no_decay_key in name:
+                    no_decay = True
+                    break
+            if no_decay:
+                return {"alpha": 0.9, "beta": 0.999, "lambda": 0.0, "epsilon": args.adam_epsilon}
+            else:
+                return {"alpha": 0.9, "beta": 0.999, "lambda": args.weight_decay, "epsilon": args.adam_epsilon}
+
+        from onnxruntime.capi._pybind_state import set_cuda_device_id, set_arena_extend_strategy, ArenaExtendStrategy
+        set_arena_extend_strategy(ArenaExtendStrategy.kSameAsRequested)
+        set_cuda_device_id(self.args.local_rank)
+
+        from .gpt2_transformer import transform_gpt2
+
+        frozen_weights = []
+        frozen_weights = list(dict(model.named_buffers()).keys())
+        frozen_weights = ['model_.'+name for name in frozen_weights]
+
+        logger.info("Frozen weights: %s", str(frozen_weights))
+        model = ORTTrainer(model, None, model_desc, "AdamOptimizer",
+            map_optimizer_attributes,
+            learning_rate_description,
+            args.device, postprocess_model=transform_gpt2, 
+            gradient_accumulation_steps=args.gradient_accumulation_steps, 
+            # BertLAMB default initial settings: b1=0.9, b2=0.999, e=1e-6
+            world_rank = self.args.world_rank,
+            world_size = self.args.n_gpu,
+            use_mixed_precision =  self.args.fp16,
+            allreduce_post_accumulation = True,
+            _opset_version=11,
+            frozen_weights = frozen_weights,
+            )
+            # frozen_weights=['model_.transformer.h.0.attn.bias','model_.transformer.h.0.attn.masked_bias'])
+        
+        logger.info("****************************Model converted to ORT")
+        return model
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
         train_sampler = (
-            RandomSampler(self.train_dataset) if self.args.local_rank == -1 else DistributedSampler(self.train_dataset)
+            RandomSampler(self.train_dataset) if self.args.local_rank == -1 else DistributedSampler(self.train_dataset, self.args.n_gpu, self.args.world_rank)
         )
         return DataLoader(
             self.train_dataset,
-            batch_size=self.args.train_batch_size,
+            batch_size=self.args.per_gpu_train_batch_size,
             sampler=train_sampler,
             collate_fn=self.data_collator.collate_batch,
         )
@@ -189,22 +270,10 @@ class Trainer:
 
     def get_optimizers(
         self, num_training_steps: int
-    ) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
+        ) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
         # Prepare optimizer and schedule (linear warmup and decay)
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.args.weight_decay,
-            },
-            {
-                "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
+        optimizer = None
+        scheduler = linear_schedule_with_warmup(num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
         )
         return optimizer, scheduler
 
@@ -228,54 +297,28 @@ class Trainer:
             t_total = int(len(train_dataloader) // self.args.gradient_accumulation_steps * self.args.num_train_epochs)
             num_train_epochs = self.args.num_train_epochs
 
-        optimizer, scheduler = self.get_optimizers(num_training_steps=t_total)
+        _, scheduler = self.get_optimizers(num_training_steps=t_total)
+        loss_scaler = LossScaler(self.ort_model.loss_scale_input_name, True, up_scale_window=2000, loss_scale=float(1 << 20)) if self.args.fp16 else 1
 
-        # Check if saved optimizer or scheduler states exist
-        if (
-            model_path is not None
-            and os.path.isfile(os.path.join(model_path, "optimizer.pt"))
-            and os.path.isfile(os.path.join(model_path, "scheduler.pt"))
-        ):
-            # Load in optimizer and scheduler states
-            optimizer.load_state_dict(torch.load(os.path.join(model_path, "optimizer.pt")))
-            scheduler.load_state_dict(torch.load(os.path.join(model_path, "scheduler.pt")))
-
-        model = self.model
-        model.to(self.args.device)
-        if self.args.fp16:
-            if not is_apex_available():
-                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-            model, optimizer = amp.initialize(model, optimizer, opt_level=self.args.fp16_opt_level)
-
-        # multi-gpu training (should be after apex fp16 initialization)
-        if self.args.n_gpu > 1:
-            model = torch.nn.DataParallel(model)
-
-        # Distributed training (should be after apex fp16 initialization)
-        if self.args.local_rank != -1:
-            model = torch.nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[self.args.local_rank],
-                output_device=self.args.local_rank,
-                find_unused_parameters=True,
-            )
+        model = self.ort_model
 
         if self.tb_writer is not None:
             self.tb_writer.add_text("args", self.args.to_json_string())
 
         # Train!
-        logger.info("***** Running training *****")
-        logger.info("  Num examples = %d", len(train_dataloader.dataset))
-        logger.info("  Num Epochs = %d", num_train_epochs)
-        logger.info("  Instantaneous batch size per GPU = %d", self.args.per_gpu_train_batch_size)
-        logger.info(
-            "  Total train batch size (w. parallel, distributed & accumulation) = %d",
-            self.args.train_batch_size
-            * self.args.gradient_accumulation_steps
-            * (torch.distributed.get_world_size() if self.args.local_rank != -1 else 1),
-        )
-        logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
-        logger.info("  Total optimization steps = %d", t_total)
+        if self.is_world_master():
+            logger.info("***** Running training *****")
+            logger.info("  Num examples = %d", len(train_dataloader.dataset))
+            logger.info("  Num Epochs = %d", num_train_epochs)
+            logger.info("  Instantaneous batch size per GPU = %d", self.args.per_gpu_train_batch_size)
+            logger.info(
+                "  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                self.args.train_batch_size
+                * self.args.gradient_accumulation_steps
+                * (self.args.n_gpu if self.args.local_rank != -1 else 1),
+            )
+            logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
+            logger.info("  Total optimization steps = %d", t_total)
 
         global_step = 0
         epochs_trained = 0
@@ -300,7 +343,8 @@ class Trainer:
 
         tr_loss = 0.0
         logging_loss = 0.0
-        model.zero_grad()
+        global_batch_train_start = 0
+
         train_iterator = trange(
             epochs_trained, int(num_train_epochs), desc="Epoch", disable=self.args.local_rank not in [-1, 0],
         )
@@ -312,61 +356,53 @@ class Trainer:
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
-
-                tr_loss += self._training_step(model, inputs, optimizer)
-
+                
+                learning_rate = torch.tensor([scheduler.get_lr_this_step(global_step, base_lr = self.args.learning_rate)])
+                loss, all_finite = self._training_step(model, inputs, learning_rate, loss_scaler)
+                tr_loss += loss
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
                     len(epoch_iterator) <= self.args.gradient_accumulation_steps
                     and (step + 1) == len(epoch_iterator)
-                ):
-                    if self.args.fp16:
-                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), self.args.max_grad_norm)
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                    ):
 
-                    optimizer.step()
-                    scheduler.step()
-                    model.zero_grad()
+                    if self.args.fp16:
+                        loss_scaler.update_loss_scale(all_finite.item())
+
                     global_step += 1
+                    global_batch_train_duration = time.time() - global_batch_train_start
+                    global_batch_train_start = time.time()
 
                     if self.args.local_rank in [-1, 0]:
                         if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
                             global_step == 1 and self.args.logging_first_step
                         ):
                             logs = {}
-                            if self.args.evaluate_during_training:
-                                results = self.evaluate()
-                                for key, value in results.items():
-                                    eval_key = "eval_{}".format(key)
-                                    logs[eval_key] = value
-
-                            loss_scalar = (tr_loss - logging_loss) / self.args.logging_steps
-                            learning_rate_scalar = [group['lr'] for group in scheduler.optimizer.param_groups][0]
-                            logs["learning_rate"] = learning_rate_scalar
-                            logs["loss"] = loss_scalar
+                            loss_avg = (tr_loss - logging_loss) / (self.args.logging_steps * self.args.gradient_accumulation_steps)
+                            logs["learning_rate"] = learning_rate.item()
+                            logs["loss"] = loss_avg
+                            logs["global_step"] = global_step
+                            logs["global_step_time"] = global_batch_train_duration
                             logging_loss = tr_loss
 
                             if self.tb_writer:
                                 for k, v in logs.items():
                                     self.tb_writer.add_scalar(k, v, global_step)
+                                    run.log(k,v)
                             epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
 
                         if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
                             # In all cases (even distributed/parallel), self.model is always a reference
                             # to the model we want to save.
                             if hasattr(model, "module"):
-                                assert model.module is self.model
+                                assert model.module is self.ort_model
                             else:
-                                assert model is self.model
+                                assert model is self.ort_model
                             # Save model checkpoint
                             output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
                             self.save_model(output_dir)
-                            self._rotate_checkpoints()
-                            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                            torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                            logger.info("Saving optimizer and scheduler states to %s", output_dir)
-
+                            # self._rotate_checkpoints()
+                            
                 if self.args.max_steps > 0 and global_step > self.args.max_steps:
                     epoch_iterator.close()
                     break
@@ -376,39 +412,40 @@ class Trainer:
 
         if self.tb_writer:
             self.tb_writer.close()
-
+        # del model
+        # del self.ort_model
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(global_step, tr_loss / global_step)
 
     def _training_step(
-        self, model: nn.Module, inputs: Dict[str, torch.Tensor], optimizer: torch.optim.Optimizer
-    ) -> float:
+        self, model: nn.Module, inputs: Dict[str, torch.Tensor], learning_rate, loss_scaler
+        ) -> float:
         model.train()
-        for k, v in inputs.items():
-            inputs[k] = v.to(self.args.device)
-
-        outputs = model(**inputs)
-        loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
-
-        if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
-        if self.args.gradient_accumulation_steps > 1:
-            loss = loss / self.args.gradient_accumulation_steps
+        # import pdb; pdb.set_trace()
+        # for k, v in inputs.items():
+        #     inputs[k] = v.to(self.args.device)
 
         if self.args.fp16:
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
+            loss_scale = torch.tensor([loss_scaler.loss_scale_])
+            result = model(inputs['input_ids'],inputs['labels'], learning_rate, loss_scale)
         else:
-            loss.backward()
+            result = model(inputs['input_ids'],inputs['labels'], learning_rate)
+        
+        all_finite = None
+        if isinstance(result, (list, tuple)):
+            loss = result[0]
+            all_finite = result[-1]
+        else:
+            loss = result
 
-        return loss.item()
+        return loss.item(), all_finite
 
     def is_world_master(self) -> bool:
         """
         This will be True only in one process, even in distributed mode,
         even when training on multiple machines.
         """
-        return self.args.local_rank == -1 or torch.distributed.get_rank() == 0
+        return self.args.local_rank in [-1, 0]
 
     def save_model(self, output_dir: Optional[str] = None):
         """
@@ -424,11 +461,10 @@ class Trainer:
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         logger.info("Saving model checkpoint to %s", output_dir)
-        # Save a trained model and configuration using `save_pretrained()`.
-        # They can then be reloaded using `from_pretrained()`
-        if not isinstance(self.model, PreTrainedModel):
-            raise ValueError("Trainer.model appears to not be a PreTrainedModel")
-        self.model.save_pretrained(output_dir)
+
+        output_file= os.path.join(output_dir, "/checkpoint.ort.pt")
+        current_state_dict = self.ort_model.state_dict()
+        torch.save({"model": current_state_dict}, output_file)
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
@@ -467,7 +503,7 @@ class Trainer:
 
     def evaluate(
         self, eval_dataset: Optional[Dataset] = None, prediction_loss_only: Optional[bool] = None
-    ) -> Dict[str, float]:
+        ) -> Dict[str, float]:
         """
         Run evaluation and return metrics.
 
@@ -499,7 +535,7 @@ class Trainer:
 
     def _prediction_loop(
         self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
-    ) -> PredictionOutput:
+        ) -> PredictionOutput:
         """
         Prediction/evaluation loop, shared by `evaluate()` and `predict()`.
 
@@ -507,17 +543,20 @@ class Trainer:
         """
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else self.prediction_loss_only
-
+        ort_state_dict = self.ort_model.state_dict()
+        torch_state_dict = dict((key.split('model_.')[1], value) for key, value in ort_state_dict.items())
+        self.model.load_state_dict(torch_state_dict, strict=False)
         # multi-gpu eval
         if self.args.n_gpu > 1 and not isinstance(self.model, torch.nn.DataParallel):
             model = torch.nn.DataParallel(self.model)
         else:
             model = self.model
+        
         model.to(self.args.device)
-
-        logger.info("***** Running %s *****", description)
-        logger.info("  Num examples = %d", len(dataloader.dataset))
-        logger.info("  Batch size = %d", dataloader.batch_size)
+        if self.is_world_master():
+            logger.info("***** Running %s *****", description)
+            logger.info("  Num examples = %d", len(dataloader.dataset))
+            logger.info("  Batch size = %d", dataloader.batch_size)
         eval_losses: List[float] = []
         preds: np.ndarray = None
         label_ids: np.ndarray = None

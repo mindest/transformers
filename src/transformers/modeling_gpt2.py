@@ -103,17 +103,17 @@ class Attention(nn.Module):
 
         n_state = nx  # in Attention: n_state=768 (nx=n_embd)
         # [switch nx => n_state from Block to Attention to keep identical to TF implem]
-        assert n_state % config.n_head == 0
+        assert n_state % config.n_head == 0      
         self.register_buffer(
-            "bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.uint8)).view(1, 1, n_ctx, n_ctx)
+            "bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.bool)).view(1, 1, n_ctx, n_ctx)
         )
         self.register_buffer("masked_bias", torch.tensor(-1e4))
         self.n_head = config.n_head
         self.split_size = n_state
         self.scale = scale
 
-        self.c_attn = Conv1D(n_state * 3, nx)
-        self.c_proj = Conv1D(n_state, nx)
+        self.c_attn = Conv1D(n_state * 3, nx, n_ctx)
+        self.c_proj = Conv1D(n_state, nx, n_ctx)
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
         self.pruned_heads = set()
@@ -166,11 +166,11 @@ class Attention(nn.Module):
 
     def merge_heads(self, x):
         x = x.permute(0, 2, 1, 3).contiguous()
-        new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
-        return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
+        new_x_shape = x.size()[:-2]
+        return x.view(*new_x_shape, -1)  # in Tensorflow implem: fct merge_states
 
     def split_heads(self, x, k=False):
-        new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)
+        new_x_shape = x.size()[:-1] + (self.n_head, self.split_size // self.n_head)
         x = x.view(*new_x_shape)  # in Tensorflow implem: fct split_states
         if k:
             return x.permute(0, 2, 3, 1)  # (batch, head, head_features, seq_length)
@@ -179,7 +179,7 @@ class Attention(nn.Module):
 
     def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, use_cache=False):
         x = self.c_attn(x)
-        query, key, value = x.split(self.split_size, dim=2)
+        query, key, value = torch.split(x, [self.split_size,self.split_size,self.split_size], dim=2)
         query = self.split_heads(query)
         key = self.split_heads(key, k=True)
         value = self.split_heads(value)
@@ -208,8 +208,8 @@ class MLP(nn.Module):
     def __init__(self, n_state, config):  # in MLP: n_state=3072 (4 * n_embd)
         super().__init__()
         nx = config.n_embd
-        self.c_fc = Conv1D(n_state, nx)
-        self.c_proj = Conv1D(nx, n_state)
+        self.c_fc = Conv1D(n_state, nx, config.n_ctx)
+        self.c_proj = Conv1D(nx, n_state, config.n_ctx)
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
 
@@ -349,6 +349,7 @@ class GPT2Model(GPT2PreTrainedModel):
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([Block(config.n_ctx, config, scale=True) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+        self.seq_length = config.n_ctx
 
         self.init_weights()
 
@@ -425,7 +426,7 @@ class GPT2Model(GPT2PreTrainedModel):
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
             input_shape = input_ids.size()
-            input_ids = input_ids.view(-1, input_shape[-1])
+            # input_ids = input_ids.view(-1, input_shape[-1])
             batch_size = input_ids.shape[0]
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
@@ -445,8 +446,8 @@ class GPT2Model(GPT2PreTrainedModel):
             past_length = past[0][0].size(-2)
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+            position_ids = torch.arange(past_length, self.seq_length + past_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).view(-1, self.seq_length)
 
         # Attention mask.
         if attention_mask is not None:
@@ -626,11 +627,11 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
             outputs = (loss,) + outputs
 
         return outputs  # (loss), lm_logits, presents, (all hidden_states), (attentions)
-
+        # return loss
 
 @add_start_docstrings(
     """The GPT2 Model transformer with a language modeling and a multiple-choice classification

@@ -25,6 +25,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+import horovod.torch as hvd
 
 from transformers import (
     CONFIG_MAPPING,
@@ -38,6 +39,7 @@ from transformers import (
     PreTrainedTokenizer,
     TextDataset,
     Trainer,
+    OrtTrainer,
     TrainingArguments,
     set_seed,
 )
@@ -135,6 +137,15 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    if training_args.ort_trainer:
+        hvd.init()
+        training_args.local_rank = hvd.local_rank()
+
+        os.environ['RANK'] = str(training_args.world_rank)
+        os.environ['WORLD_SIZE'] = str(hvd.size())
+        os.environ['MASTER_ADDR'] = training_args.master_node
+        os.environ['MASTER_PORT'] = str(training_args.master_port)
+
     if data_args.eval_data_file is None and training_args.do_eval:
         raise ValueError(
             "Cannot do evaluation without an evaluation data file. Either supply a file to --eval_data_file "
@@ -183,7 +194,7 @@ def main():
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
-    # config.n_layer=1
+    # config.n_layer=12
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, cache_dir=model_args.cache_dir)
     elif model_args.model_name_or_path:
@@ -234,8 +245,9 @@ def main():
         tokenizer=tokenizer, mlm=data_args.mlm, mlm_probability=data_args.mlm_probability
     )
 
+    trainer = OrtTrainer if training_args.ort_trainer else Trainer
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = trainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
@@ -256,8 +268,9 @@ def main():
         trainer.save_model()
         # For convenience, we also re-save the tokenizer to the same directory,
         # so that you can share your model easily on huggingface.co/models =)
-        if trainer.is_world_master():
-            tokenizer.save_pretrained(training_args.output_dir)
+        # print("##################", trainer.local_rank)
+        # if trainer.is_world_master():
+            # tokenizer.save_pretrained(training_args.output_dir)
 
     # Evaluation
     results = {}

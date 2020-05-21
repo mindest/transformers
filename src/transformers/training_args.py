@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import logging
+import horovod.torch as hvd
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -82,6 +83,9 @@ class TrainingArguments:
         },
     )
     local_rank: int = field(default=-1, metadata={"help": "For distributed training: local_rank"})
+    master_port: int = field(default=12345, metadata={"help": "For distributed training: free port on rank 0 node"})
+    master_node: str = field(default="localhost", metadata={"help": "For distributed training: address of rank 0 node"})
+    ort_trainer: bool = field(default=False, metadata={"help": "Use ORT to train instead of PyTorch"})
 
     @property
     def train_batch_size(self) -> int:
@@ -98,6 +102,10 @@ class TrainingArguments:
         if self.no_cuda:
             device = torch.device("cpu")
             n_gpu = 0
+        elif self.ort_trainer:
+            torch.distributed.init_process_group(backend="nccl")
+            device = torch.device("cuda", self.local_rank)
+            n_gpu = hvd.size()
         elif self.local_rank == -1:
             # if n_gpu is > 1 we'll use nn.DataParallel.
             # If you only want to use a specific subset of GPUs use `CUDA_VISIBLE_DEVICES=0`
@@ -120,6 +128,14 @@ class TrainingArguments:
     @torch_required
     def n_gpu(self):
         return self._setup_devices[1]
+    
+    @property
+    def world_rank(self):
+        world_rank = self.local_rank
+        try:
+            return(hvd.rank())
+        except:
+            return(self.local_rank)
 
     def to_json_string(self):
         """
