@@ -74,6 +74,7 @@ def torch_distributed_zero_first(local_rank: int):
     if local_rank == 0:
         torch.distributed.barrier()
 
+
 class EvalPrediction(NamedTuple):
     """
     Evaluation output (always contains labels), to be used
