@@ -235,17 +235,26 @@ def main():
         tokenizer=tokenizer, mlm=data_args.mlm, mlm_probability=data_args.mlm_probability
     )
 
-    trainer = OrtTrainer if training_args.ort_trainer else Trainer
     # Initialize our Trainer
-    trainer = trainer(
-        model=model,
-        args=training_args,
-        data_collator=data_collator,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        prediction_loss_only=True,
-        config=config
-    )
+    if training_args.ort_trainer:
+        trainer = OrtTrainer(
+            model=model,
+            args=training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            prediction_loss_only=True,
+            config=config
+        ) 
+    else:    
+        trainer = trainer(
+            model=model,
+            args=training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            prediction_loss_only=True,
+        )
 
     # Training
     if training_args.do_train:

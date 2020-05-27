@@ -21,7 +21,6 @@ from .data.data_collator import DataCollator, DefaultDataCollator
 from .modeling_utils import PreTrainedModel
 from .optimization import AdamW, get_linear_schedule_with_warmup
 from .training_args import TrainingArguments
-from .configuration_auto import AutoConfig
 
 
 try:
@@ -113,7 +112,6 @@ class Trainer:
     compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None
     prediction_loss_only: bool
     tb_writer: Optional["SummaryWriter"] = None
-    config: Optional[AutoConfig] = None
 
     def __init__(
         self,
@@ -124,7 +122,6 @@ class Trainer:
         eval_dataset: Optional[Dataset] = None,
         compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
         prediction_loss_only=False,
-        config: Optional[AutoConfig] = None,
     ):
         """
         Trainer is a simple but feature-complete training and eval loop for PyTorch,
@@ -342,7 +339,7 @@ class Trainer:
                                     logs[eval_key] = value
 
                             loss_scalar = (tr_loss - logging_loss) / self.args.logging_steps
-                            learning_rate_scalar = [group['lr'] for group in scheduler.optimizer.param_groups][0]
+                            learning_rate_scalar = scheduler.get_last_lr()[0]
                             logs["learning_rate"] = learning_rate_scalar
                             logs["loss"] = loss_scalar
                             logging_loss = tr_loss
