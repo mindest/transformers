@@ -17,7 +17,6 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler
 from tqdm import tqdm, trange
-import horovod.torch as hvd
 
 from onnxruntime.capi.ort_trainer import ORTTrainer, IODescription, ModelDescription
 from onnxruntime.capi.ort_trainer import LossScaler
@@ -165,6 +164,7 @@ class OrtTrainer:
         torch.cuda.set_device(self.args.local_rank)
 
         self.ort_model = self.to_ort_model(model, config, args)
+        self.ort_state_dict = None
 
     def gpt2_model_description(self,n_head, vocab_size, n_hidden, n_layer, n_ctx, batch_size):
     
@@ -412,8 +412,11 @@ class OrtTrainer:
 
         if self.tb_writer:
             self.tb_writer.close()
+        torch.distributed.barrier()
         # del model
-        # del self.ort_model
+        self.ort_state_dict = self.ort_model.state_dict()
+        del self.ort_model
+        torch.distributed.barrier()
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(global_step, tr_loss / global_step)
 
@@ -463,7 +466,10 @@ class OrtTrainer:
         logger.info("Saving model checkpoint to %s", output_dir)
 
         output_file= os.path.join(output_dir, "/checkpoint.ort.pt")
-        current_state_dict = self.ort_model.state_dict()
+        current_state_dict = self.ort_state_dict
+        if not current_state_dict:
+            assert self.ort_model, "ORT model doesn't exist."
+            current_state_dict = self.ort_model.state_dict()
         torch.save({"model": current_state_dict}, output_file)
 
         # Good practice: save your training arguments together with the trained model
@@ -543,9 +549,9 @@ class OrtTrainer:
         """
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else self.prediction_loss_only
-        ort_state_dict = self.ort_model.state_dict()
-        torch_state_dict = dict((key.split('model_.')[1], value) for key, value in ort_state_dict.items())
-        self.model.load_state_dict(torch_state_dict, strict=False)
+        if self.ort_state_dict:
+            torch_state_dict = dict((key.split('model_.')[1], value) for key, value in self.ort_state_dict.items())
+            self.model.load_state_dict(torch_state_dict, strict=False)
         # multi-gpu eval
         if self.args.n_gpu > 1 and not isinstance(self.model, torch.nn.DataParallel):
             model = torch.nn.DataParallel(self.model)

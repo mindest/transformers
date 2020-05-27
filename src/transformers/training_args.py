@@ -1,7 +1,7 @@
 import dataclasses
 import json
 import logging
-import horovod.torch as hvd
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -83,6 +83,8 @@ class TrainingArguments:
         },
     )
     local_rank: int = field(default=-1, metadata={"help": "For distributed training: local_rank"})
+    world_rank: int = field(default=-1, metadata={"help": "For distributed training: world_rank"})
+    world_size: int = field(default=1, metadata={"help": "For distributed training: world_size"})
     master_port: int = field(default=12345, metadata={"help": "For distributed training: free port on rank 0 node"})
     master_node: str = field(default="localhost", metadata={"help": "For distributed training: address of rank 0 node"})
     ort_trainer: bool = field(default=False, metadata={"help": "Use ORT to train instead of PyTorch"})
@@ -103,9 +105,15 @@ class TrainingArguments:
             device = torch.device("cpu")
             n_gpu = 0
         elif self.ort_trainer:
+            self.update_args()
+            os.environ['RANK'] = str(self.world_rank)
+            os.environ['WORLD_SIZE'] = str(self.world_size)
+            os.environ['MASTER_ADDR'] = self.master_node
+            os.environ['MASTER_PORT'] = str(self.master_port)
+
             torch.distributed.init_process_group(backend="nccl")
             device = torch.device("cuda", self.local_rank)
-            n_gpu = hvd.size()
+            n_gpu = self.world_size
         elif self.local_rank == -1:
             # if n_gpu is > 1 we'll use nn.DataParallel.
             # If you only want to use a specific subset of GPUs use `CUDA_VISIBLE_DEVICES=0`
@@ -129,16 +137,34 @@ class TrainingArguments:
     def n_gpu(self):
         return self._setup_devices[1]
     
-    @property
-    def world_rank(self):
-        world_rank = self.local_rank
-        try:
-            return(hvd.rank())
-        except:
-            return(self.local_rank)
-
     def to_json_string(self):
         """
         Serializes this instance to a JSON string.
         """
         return json.dumps(dataclasses.asdict(self), indent=2)
+
+    def update_args_from_env(self):
+        self.local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+        self.world_rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+        self.world_size = int(os.environ['OMPI_COMM_WORLD_SIZE'])
+
+        #NCCL environment. Still works without it.
+        #os.environ['NCCL_SOCKET_IFNAME'] = '^docker0,lo'
+        os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'
+        os.environ["NCCL_IB_DISABLE"] = '0' #for IB
+
+        # Only for multi node. This env is not present for single node AML jobs
+        if 'AZ_BATCH_MASTER_NODE' in os.environ:
+            master_node_params = os.environ['AZ_BATCH_MASTER_NODE'].split(':')        
+            self.master_node = master_node_params[0]
+            self.master_port = master_node_params[1]
+        elif 'AZ_BATCHAI_MPI_MASTER_NODE' in os.environ:
+            self.master_node = os.environ['AZ_BATCHAI_MPI_MASTER_NODE']
+    
+    def update_args(self):
+        if 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ:
+            self.update_args_from_env()
+        else:
+            self.local_rank = 0
+            self.world_rank = 0
+            self.world_size = 1

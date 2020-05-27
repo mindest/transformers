@@ -25,7 +25,6 @@ import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
-import horovod.torch as hvd
 
 from transformers import (
     CONFIG_MAPPING,
@@ -136,15 +135,6 @@ def main():
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-    if training_args.ort_trainer:
-        hvd.init()
-        training_args.local_rank = hvd.local_rank()
-
-        os.environ['RANK'] = str(training_args.world_rank)
-        os.environ['WORLD_SIZE'] = str(hvd.size())
-        os.environ['MASTER_ADDR'] = training_args.master_node
-        os.environ['MASTER_PORT'] = str(training_args.master_port)
 
     if data_args.eval_data_file is None and training_args.do_eval:
         raise ValueError(
