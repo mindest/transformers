@@ -184,7 +184,7 @@ def main():
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
-    # config.n_layer=12
+
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, cache_dir=model_args.cache_dir)
     elif model_args.model_name_or_path:
@@ -235,26 +235,16 @@ def main():
         tokenizer=tokenizer, mlm=data_args.mlm, mlm_probability=data_args.mlm_probability
     )
 
+    trainer = OrtTrainer if training_args.ort_trainer else Trainer
     # Initialize our Trainer
-    if training_args.ort_trainer:
-        trainer = OrtTrainer(
-            model=model,
-            args=training_args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            prediction_loss_only=True,
-            config=config
-        ) 
-    else:    
-        trainer = trainer(
-            model=model,
-            args=training_args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            prediction_loss_only=True,
-        )
+    trainer = trainer(
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        prediction_loss_only=True,
+    )
 
     # Training
     if training_args.do_train:
@@ -267,9 +257,8 @@ def main():
         trainer.save_model()
         # For convenience, we also re-save the tokenizer to the same directory,
         # so that you can share your model easily on huggingface.co/models =)
-        # print("##################", trainer.local_rank)
-        # if trainer.is_world_master():
-            # tokenizer.save_pretrained(training_args.output_dir)
+        if trainer.is_world_master():
+            tokenizer.save_pretrained(training_args.output_dir)
 
     # Evaluation
     results = {}

@@ -18,6 +18,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler
 from tqdm import tqdm, trange
 
+import onnxruntime
 from onnxruntime.capi.ort_trainer import ORTTrainer, IODescription, ModelDescription
 from onnxruntime.capi.ort_trainer import LossScaler
 
@@ -25,7 +26,7 @@ from .data.data_collator import DataCollator, DefaultDataCollator
 from .modeling_utils import PreTrainedModel
 from .optimization_ort import linear_schedule_with_warmup
 from .training_args import TrainingArguments
-from .configuration_auto import AutoConfig
+from .trainer import PredictionOutput, TrainOutput, EvalPrediction, set_seed
 
 from azureml.core.run import Run
 # get the Azure ML run object
@@ -62,44 +63,6 @@ def is_tensorboard_available():
 
 logger = logging.getLogger(__name__)
 
-
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # ^^ safe to call this function even if cuda is not available
-
-
-@contextmanager
-def torch_distributed_zero_first(local_rank: int):
-    """
-    Decorator to make all processes in distributed training wait for the first one (locally) to do something.
-    """
-    yield
-
-
-class EvalPrediction(NamedTuple):
-    """
-    Evaluation output (always contains labels), to be used
-    to compute metrics.
-    """
-
-    predictions: np.ndarray
-    label_ids: np.ndarray
-
-
-class PredictionOutput(NamedTuple):
-    predictions: np.ndarray
-    label_ids: Optional[np.ndarray]
-    metrics: Optional[Dict[str, float]]
-
-
-class TrainOutput(NamedTuple):
-    global_step: int
-    training_loss: float
-
-
 PREFIX_CHECKPOINT_DIR = "ort_checkpoint"
 
 
@@ -117,7 +80,6 @@ class OrtTrainer:
     compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None
     prediction_loss_only: bool
     tb_writer: Optional["SummaryWriter"] = None
-    config: Optional[AutoConfig] = None
 
 
     def __init__(
@@ -129,7 +91,6 @@ class OrtTrainer:
         eval_dataset: Optional[Dataset] = None,
         compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
         prediction_loss_only=False,
-        config: Optional[AutoConfig] = None,
         ):
         """
         Trainer is a simple but feature-complete training and eval loop for PyTorch,
@@ -157,14 +118,27 @@ class OrtTrainer:
                 "You are instantiating a Trainer but Tensorboard is not installed. You should consider installing it."
             )
         set_seed(self.args.seed)
+        onnxruntime.set_seed(self.args.seed)
         # Create output directory if needed
         if self.args.local_rank in [-1, 0]:
             os.makedirs(self.args.output_dir, exist_ok=True)
         
         torch.cuda.set_device(self.args.local_rank)
 
-        self.ort_model = self.to_ort_model(model, config, args)
-        self.ort_state_dict = None
+        self.ort_model = self.to_ort_model(model, model.config, args)
+
+    def update_torch_model(self,):
+        if self.ort_model:
+            logger.info(
+                "Updating weights of torch model from ORT model."
+            )
+            ort_state_dict = self.ort_model.state_dict()
+            torch_state_dict = dict((key.split('model_.')[1], value) for key, value in ort_state_dict.items())
+            self.model.load_state_dict(torch_state_dict, strict=False)
+        else:
+            logger.warning(
+                "No ORT model found to update weights from, assuming torch model is up to date."
+            )
 
     def gpt2_model_description(self,n_head, vocab_size, n_hidden, n_layer, n_ctx, batch_size):
     
@@ -412,11 +386,9 @@ class OrtTrainer:
 
         if self.tb_writer:
             self.tb_writer.close()
-        torch.distributed.barrier()
-        # del model
-        self.ort_state_dict = self.ort_model.state_dict()
-        del self.ort_model
-        torch.distributed.barrier()
+        self.update_torch_model()
+        self.ort_model = None
+        
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(global_step, tr_loss / global_step)
 
@@ -465,12 +437,12 @@ class OrtTrainer:
         os.makedirs(output_dir, exist_ok=True)
         logger.info("Saving model checkpoint to %s", output_dir)
 
-        output_file= os.path.join(output_dir, "/checkpoint.ort.pt")
-        current_state_dict = self.ort_state_dict
-        if not current_state_dict:
-            assert self.ort_model, "ORT model doesn't exist."
-            current_state_dict = self.ort_model.state_dict()
-        torch.save({"model": current_state_dict}, output_file)
+        self.update_torch_model()
+        # Save a trained model and configuration using `save_pretrained()`.
+        # They can then be reloaded using `from_pretrained()`
+        if not isinstance(self.model, PreTrainedModel):
+            raise ValueError("Trainer.model appears to not be a PreTrainedModel")
+        self.model.save_pretrained(output_dir)
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
@@ -549,9 +521,7 @@ class OrtTrainer:
         """
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else self.prediction_loss_only
-        if self.ort_state_dict:
-            torch_state_dict = dict((key.split('model_.')[1], value) for key, value in self.ort_state_dict.items())
-            self.model.load_state_dict(torch_state_dict, strict=False)
+        self.update_torch_model()
         # multi-gpu eval
         if self.args.n_gpu > 1 and not isinstance(self.model, torch.nn.DataParallel):
             model = torch.nn.DataParallel(self.model)
