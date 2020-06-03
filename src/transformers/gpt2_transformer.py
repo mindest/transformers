@@ -309,6 +309,6 @@ def transform_gpt2(model):
 
     print("******************transformation done.")
     # To be removed. For debug only.
-    input_model_name = "models/gpt2_after_postprocessing_1L_allop.onnx"
-    onnx.save(model, input_model_name)
+    # input_model_name = "models/gpt2_after_postprocessing_1L_allop.onnx"
+    # onnx.save(model, input_model_name)
 

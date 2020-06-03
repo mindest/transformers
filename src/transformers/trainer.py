@@ -142,7 +142,7 @@ class Trainer:
         self.eval_dataset = eval_dataset
         self.compute_metrics = compute_metrics
         self.prediction_loss_only = prediction_loss_only
-        if is_tensorboard_available() and self.args.local_rank in [-1, 0]:
+        if is_tensorboard_available() and self.is_world_master():
             self.tb_writer = SummaryWriter(log_dir=self.args.logging_dir)
         if not is_tensorboard_available():
             logger.warning(
@@ -150,7 +150,7 @@ class Trainer:
             )
         set_seed(self.args.seed)
         # Create output directory if needed
-        if self.args.local_rank in [-1, 0]:
+        if self.is_world_master():
             os.makedirs(self.args.output_dir, exist_ok=True)
 
     def get_train_dataloader(self) -> DataLoader:

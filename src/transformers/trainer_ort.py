@@ -111,7 +111,7 @@ class OrtTrainer:
         self.compute_metrics = compute_metrics
         self.prediction_loss_only = prediction_loss_only
 
-        if is_tensorboard_available() and self.args.local_rank in [-1, 0]:
+        if is_tensorboard_available() and self.is_world_master():
             self.tb_writer = SummaryWriter(log_dir=self.args.logging_dir)
         if not is_tensorboard_available():
             logger.warning(
@@ -120,7 +120,7 @@ class OrtTrainer:
         set_seed(self.args.seed)
         onnxruntime.set_seed(self.args.seed)
         # Create output directory if needed
-        if self.args.local_rank in [-1, 0]:
+        if self.is_world_master():
             os.makedirs(self.args.output_dir, exist_ok=True)
         
         torch.cuda.set_device(self.args.local_rank)
@@ -199,7 +199,7 @@ class OrtTrainer:
             gradient_accumulation_steps=args.gradient_accumulation_steps, 
             # BertLAMB default initial settings: b1=0.9, b2=0.999, e=1e-6
             world_rank = self.args.world_rank,
-            world_size = self.args.n_gpu,
+            world_size = self.args.world_size,
             use_mixed_precision =  self.args.fp16,
             allreduce_post_accumulation = True,
             _opset_version=11,
@@ -214,7 +214,7 @@ class OrtTrainer:
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
         train_sampler = (
-            RandomSampler(self.train_dataset) if self.args.local_rank == -1 else DistributedSampler(self.train_dataset, self.args.n_gpu, self.args.world_rank)
+            RandomSampler(self.train_dataset) if self.args.local_rank == -1 else DistributedSampler(self.train_dataset)
         )
         return DataLoader(
             self.train_dataset,
@@ -289,7 +289,7 @@ class OrtTrainer:
                 "  Total train batch size (w. parallel, distributed & accumulation) = %d",
                 self.args.train_batch_size
                 * self.args.gradient_accumulation_steps
-                * (self.args.n_gpu if self.args.local_rank != -1 else 1),
+                * (self.args.world_size if self.args.local_rank != -1 else 1),
             )
             logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
             logger.info("  Total optimization steps = %d", t_total)
@@ -387,6 +387,7 @@ class OrtTrainer:
         if self.tb_writer:
             self.tb_writer.close()
         self.update_torch_model()
+        del(self.ort_model)
         self.ort_model = None
         
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
@@ -420,7 +421,7 @@ class OrtTrainer:
         This will be True only in one process, even in distributed mode,
         even when training on multiple machines.
         """
-        return self.args.local_rank in [-1, 0]
+        return self.args.local_rank == -1 or torch.distributed.get_rank() == 0
 
     def save_model(self, output_dir: Optional[str] = None):
         """
