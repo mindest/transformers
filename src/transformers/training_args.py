@@ -140,9 +140,11 @@ class TrainingArguments:
         has_aml = 'AZ_BATCH_MASTER_NODE' in os.environ.keys() or 'AZ_BATCHAI_MPI_MASTER_NODE' in os.environ.keys()
         if not has_aml:
             print('Detected local run')
-            self.local_rank = comm.Get_rank() % torch.cuda.device_count()
-            self.world_rank = comm.Get_rank()
             self.world_size = comm.Get_size()
+            if(self.world_size > 1):
+                self.local_rank = comm.Get_rank() % torch.cuda.device_count()
+                self.world_rank = comm.Get_rank()
+            
 
             os.environ['RANK'] = str(self.world_rank)
             os.environ['WORLD_SIZE'] = str(self.world_size)
@@ -156,8 +158,8 @@ class TrainingArguments:
             self.world_rank = get_world_rank()
             self.world_size = get_global_size()
 
-            print('Local rank: {}'.format(self.local_rank))
             print('Local size: {}'.format(get_local_size()))
-            print('World rank: {}'.format(self.world_rank))
-            print('World size: {}'.format(self.world_size))
-            print('CUDA device: {}'.format(self.local_rank))
+        print('Local rank: {}'.format(self.local_rank))
+        print('World rank: {}'.format(self.world_rank))
+        print('World size: {}'.format(self.world_size))
+        print('CUDA device: {}'.format(self.local_rank))

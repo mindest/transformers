@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
+from packaging import version
 import numpy as np
 import torch
 from torch import nn
@@ -340,7 +341,11 @@ class Trainer:
                                     logs[eval_key] = value
 
                             loss_scalar = (tr_loss - logging_loss) / self.args.logging_steps
-                            learning_rate_scalar = scheduler.get_last_lr()[0]
+                            learning_rate_scalar = (
+                                scheduler.get_last_lr()[0]
+                                if version.parse(torch.__version__) >= version.parse("1.4")
+                                else scheduler.get_lr()[0]
+                                )
                             logs["learning_rate"] = learning_rate_scalar
                             logs["loss"] = loss_scalar
                             logging_loss = tr_loss
