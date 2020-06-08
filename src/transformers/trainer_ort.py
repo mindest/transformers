@@ -5,6 +5,7 @@ import os
 import random
 import re
 import shutil
+import h5py
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
@@ -27,6 +28,8 @@ from .modeling_utils import PreTrainedModel
 from .optimization_ort import linear_schedule_with_warmup
 from .training_args import TrainingArguments
 from .trainer import PredictionOutput, TrainOutput, EvalPrediction, set_seed
+
+from concurrent.futures import ProcessPoolExecutor
 
 from azureml.core.run import Run
 # get the Azure ML run object
@@ -59,6 +62,40 @@ except ImportError:
 
 def is_tensorboard_available():
     return _has_tensorboard
+
+
+class WorkerInitObj(object):
+    def __init__(self, seed):
+        self.seed = seed
+    def __call__(self, id):
+        np.random.seed(seed=self.seed + id)
+        random.seed(self.seed + id)
+
+
+class PretrainingDataset(Dataset):
+    def __init__(self, input_file):
+        self.input_file = input_file
+        f = h5py.File(input_file, "r")
+        self.inputs = np.asarray(f['input_ids'][:])
+        f.close()
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.inputs)
+
+    def __getitem__(self, index):
+        # [input_ids, labels]
+        return [torch.from_numpy(self.inputs[index].astype(np.int64)), torch.from_numpy(self.inputs[index].astype(np.int64))]
+
+
+def create_pretraining_dataset(input_file, args, worker_init):
+    train_data = PretrainingDataset(input_file=input_file)
+    train_sampler = SequentialSampler(train_data)
+    train_dataloader = DataLoader(train_data, sampler=train_sampler,
+                                  batch_size=args.per_gpu_train_batch_size,
+                                  num_workers=4, worker_init_fn=worker_init,
+                                  pin_memory=True)
+    return train_dataloader, input_file
 
 
 logger = logging.getLogger(__name__)
@@ -162,7 +199,7 @@ class OrtTrainer:
     def to_ort_model(self,model, config, args):
         # set GPU memory limitation
         from onnxruntime.capi._pybind_state import set_cuda_mem_limit
-        ort_cuda_mem_limit_in_gbs = 15
+        ort_cuda_mem_limit_in_gbs = 32
         set_cuda_mem_limit(int(ort_cuda_mem_limit_in_gbs * 1024 * 1024 *1024))
 
         # model_desc = gpt2_model_description(12, 50257, 1024, 6, 1024)
@@ -189,7 +226,7 @@ class OrtTrainer:
 
         frozen_weights = []
         frozen_weights = list(dict(model.named_buffers()).keys())
-        frozen_weights = ['model_.'+name for name in frozen_weights]
+        frozen_weights = [name for name in frozen_weights]
 
         logger.info("Frozen weights: %s", str(frozen_weights))
         model = ORTTrainer(model, None, model_desc, "AdamOptimizer",
@@ -260,16 +297,20 @@ class OrtTrainer:
                 (Optional) Local path to model if model to train has been instantiated from a local path
                 If present, we will try reloading the optimizer/scheduler states from there.
         """
-        train_dataloader = self.get_train_dataloader()
-
-        if self.args.max_steps > 0:
-            t_total = self.args.max_steps
-            num_train_epochs = (
-                self.args.max_steps // (len(train_dataloader) // self.args.gradient_accumulation_steps) + 1
-            )
+        train_dataloader = None
+        if self.args.train_data_dir is None:
+            self.get_train_dataloader()
+            if self.args.max_steps > 0:
+                t_total = self.args.max_steps
+                num_train_epochs = (
+                    self.args.max_steps // (len(train_dataloader) // self.args.gradient_accumulation_steps) + 1
+                )
+            else:
+                t_total = int(len(train_dataloader) // self.args.gradient_accumulation_steps * self.args.num_train_epochs)
+                num_train_epochs = self.args.num_train_epochs
         else:
-            t_total = int(len(train_dataloader) // self.args.gradient_accumulation_steps * self.args.num_train_epochs)
-            num_train_epochs = self.args.num_train_epochs
+            assert self.args.max_steps > 0
+            t_total = self.args.max_steps
 
         _, scheduler = self.get_optimizers(num_training_steps=t_total)
         loss_scaler = LossScaler(self.ort_model.loss_scale_input_name, True, up_scale_window=2000, loss_scale=float(1 << 20)) if self.args.fp16 else 1
@@ -282,12 +323,12 @@ class OrtTrainer:
         # Train!
         if self.is_world_master():
             logger.info("***** Running training *****")
-            logger.info("  Num examples = %d", len(train_dataloader.dataset))
-            logger.info("  Num Epochs = %d", num_train_epochs)
+            #logger.info("  Num examples = %d", len(train_dataloader.dataset))
+            #logger.info("  Num Epochs = %d", num_train_epochs)
             logger.info("  Instantaneous batch size per GPU = %d", self.args.per_gpu_train_batch_size)
             logger.info(
                 "  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                self.args.train_batch_size
+                self.args.per_gpu_train_batch_size
                 * self.args.gradient_accumulation_steps
                 * (self.args.world_size if self.args.local_rank != -1 else 1),
             )
@@ -318,71 +359,169 @@ class OrtTrainer:
         tr_loss = 0.0
         logging_loss = 0.0
         global_batch_train_start = 0
+        epoch = 0
 
-        train_iterator = trange(
-            epochs_trained, int(num_train_epochs), desc="Epoch", disable=self.args.local_rank not in [-1, 0],
-        )
-        for epoch in train_iterator:
-            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=self.args.local_rank not in [-1, 0])
-            for step, inputs in enumerate(epoch_iterator):
+        if self.args.train_data_dir is not None:
+            worker_init = WorkerInitObj(self.args.seed + self.args.local_rank)
+            pool = ProcessPoolExecutor(1)
+            while True:
+                files = [os.path.join(self.args.train_data_dir, f) for f in os.listdir(self.args.train_data_dir) if os.path.isfile(os.path.join(self.args.train_data_dir, f))]
+                files.sort()
+                num_files = len(files)
+                random.Random(self.args.seed + epoch).shuffle(files)
+                f_start_id = 0
 
-                # Skip past any already trained steps if resuming training
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    continue
-                
-                learning_rate = torch.tensor([scheduler.get_lr_this_step(global_step, base_lr = self.args.learning_rate)])
-                loss, all_finite = self._training_step(model, inputs, learning_rate, loss_scaler)
-                tr_loss += loss
-                if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    len(epoch_iterator) <= self.args.gradient_accumulation_steps
-                    and (step + 1) == len(epoch_iterator)
-                    ):
+                if self.args.world_size > num_files:
+                    remainder = self.args.world_size % num_files
+                    data_file = files[(f_start_id*self.args.world_size+self.args.world_rank + remainder*f_start_id)%num_files]
+                else:
+                    data_file = files[(f_start_id*self.args.world_size+self.args.world_rank)%num_files]
 
-                    if self.args.fp16:
-                        loss_scaler.update_loss_scale(all_finite.item())
+                previous_file = data_file
+                train_data = PretrainingDataset(data_file)
+                train_sampler = RandomSampler(train_data)
+                train_dataloader = DataLoader(train_data, sampler=train_sampler,
+                                              batch_size=self.args.per_gpu_train_batch_size,
+                                              num_workers=4, worker_init_fn=worker_init,
+                                              pin_memory=True)
 
-                    global_step += 1
-                    global_batch_train_duration = time.time() - global_batch_train_start
-                    global_batch_train_start = time.time()
+                for f_id in range(f_start_id + 1, len(files)):
+                    if self.args.world_size > num_files:
+                        data_file = files[(f_id*self.args.world_size+self.args.world_rank + remainder*f_id)%num_files]
+                    else:
+                        data_file = files[(f_id*self.args.world_size+self.args.world_rank)%num_files]
 
-                    if self.args.local_rank in [-1, 0]:
-                        if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
-                            global_step == 1 and self.args.logging_first_step
+                    previous_file = data_file
+
+                    dataset_future = pool.submit(create_pretraining_dataset, data_file, self.args, worker_init)
+
+                    train_iter = tqdm(train_dataloader, desc="Iteration") if self.args.local_rank in [-1, 0] else train_dataloader
+
+                    for step, batch in enumerate(train_iter):
+                        inputs = {'input_ids': batch[0], 'labels': batch[1]}
+                        learning_rate = torch.tensor([scheduler.get_lr_this_step(global_step, base_lr = self.args.learning_rate)])
+                        loss, all_finite = self._training_step(model, inputs, learning_rate, loss_scaler)
+                        tr_loss += loss
+                        if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
+                            # last step in epoch but step is always smaller than gradient_accumulation_steps
+                            len(epoch_iterator) <= self.args.gradient_accumulation_steps
+                            and (step + 1) == len(epoch_iterator)
+                            ):
+
+                            if self.args.fp16:
+                                loss_scaler.update_loss_scale(all_finite.item())
+
+                            global_step += 1
+
+                            """
+                            if self.args.local_rank in [-1, 0]:
+                                if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
+                                    global_step == 1 and self.args.logging_first_step
+                                ):
+                                    logs = {}
+                                    loss_avg = (tr_loss - logging_loss) / (self.args.logging_steps * self.args.gradient_accumulation_steps)
+                                    logs["learning_rate"] = learning_rate.item()
+                                    logs["loss"] = loss_avg
+                                    logs["global_step"] = global_step
+                                    logs["global_step_time"] = global_batch_train_duration
+                                    logging_loss = tr_loss
+
+                                    if self.tb_writer:
+                                        for k, v in logs.items():
+                                            self.tb_writer.add_scalar(k, v, global_step)
+                                            run.log(k,v)
+                                    epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
+
+                                if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
+                                    # In all cases (even distributed/parallel), self.model is always a reference
+                                    # to the model we want to save.
+                                    if hasattr(model, "module"):
+                                        assert model.module is self.ort_model
+                                    else:
+                                        assert model is self.ort_model
+                                    # Save model checkpoint
+                                    output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
+                                    self.save_model(output_dir)
+                                    # self._rotate_checkpoints()
+                                """
+
+                            if global_step >= self.args.max_steps:
+                                del train_dataloader
+                                # thread.join()
+                                return args, final_loss, train_time_raw, global_step
+
+                    del train_dataloader
+                    # thread.join()
+                    # Make sure pool has finished and switch train_dataloader
+                    # NOTE: Will block until complete
+                    train_dataloader, data_file = dataset_future.result(timeout=None)
+
+                epoch += 1
+        else:
+            train_iterator = trange(
+                epochs_trained, int(num_train_epochs), desc="Epoch", disable=self.args.local_rank not in [-1, 0],
+            )
+            for epoch in train_iterator:
+                epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=self.args.local_rank not in [-1, 0])
+                for step, inputs in enumerate(epoch_iterator):
+
+                    # Skip past any already trained steps if resuming training
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        continue
+                    
+                    learning_rate = torch.tensor([scheduler.get_lr_this_step(global_step, base_lr = self.args.learning_rate)])
+                    loss, all_finite = self._training_step(model, inputs, learning_rate, loss_scaler)
+                    tr_loss += loss
+                    if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
+                        # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        len(epoch_iterator) <= self.args.gradient_accumulation_steps
+                        and (step + 1) == len(epoch_iterator)
                         ):
-                            logs = {}
-                            loss_avg = (tr_loss - logging_loss) / (self.args.logging_steps * self.args.gradient_accumulation_steps)
-                            logs["learning_rate"] = learning_rate.item()
-                            logs["loss"] = loss_avg
-                            logs["global_step"] = global_step
-                            logs["global_step_time"] = global_batch_train_duration
-                            logging_loss = tr_loss
 
-                            if self.tb_writer:
-                                for k, v in logs.items():
-                                    self.tb_writer.add_scalar(k, v, global_step)
-                                    run.log(k,v)
-                            epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
+                        if self.args.fp16:
+                            loss_scaler.update_loss_scale(all_finite.item())
 
-                        if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
-                            # In all cases (even distributed/parallel), self.model is always a reference
-                            # to the model we want to save.
-                            if hasattr(model, "module"):
-                                assert model.module is self.ort_model
-                            else:
-                                assert model is self.ort_model
-                            # Save model checkpoint
-                            output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
-                            self.save_model(output_dir)
-                            # self._rotate_checkpoints()
-                            
+                        global_step += 1
+                        global_batch_train_duration = time.time() - global_batch_train_start
+                        global_batch_train_start = time.time()
+
+                        if self.args.local_rank in [-1, 0]:
+                            if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
+                                global_step == 1 and self.args.logging_first_step
+                            ):
+                                logs = {}
+                                loss_avg = (tr_loss - logging_loss) / (self.args.logging_steps * self.args.gradient_accumulation_steps)
+                                logs["learning_rate"] = learning_rate.item()
+                                logs["loss"] = loss_avg
+                                logs["global_step"] = global_step
+                                logs["global_step_time"] = global_batch_train_duration
+                                logging_loss = tr_loss
+
+                                if self.tb_writer:
+                                    for k, v in logs.items():
+                                        self.tb_writer.add_scalar(k, v, global_step)
+                                        run.log(k,v)
+                                epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
+
+                            if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
+                                # In all cases (even distributed/parallel), self.model is always a reference
+                                # to the model we want to save.
+                                if hasattr(model, "module"):
+                                    assert model.module is self.ort_model
+                                else:
+                                    assert model is self.ort_model
+                                # Save model checkpoint
+                                output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
+                                self.save_model(output_dir)
+                                # self._rotate_checkpoints()
+                                
+                    if self.args.max_steps > 0 and global_step > self.args.max_steps:
+                        epoch_iterator.close()
+                        break
                 if self.args.max_steps > 0 and global_step > self.args.max_steps:
-                    epoch_iterator.close()
+                    train_iterator.close()
                     break
-            if self.args.max_steps > 0 and global_step > self.args.max_steps:
-                train_iterator.close()
-                break
 
         if self.tb_writer:
             self.tb_writer.close()

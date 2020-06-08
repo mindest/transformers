@@ -114,6 +114,15 @@ class DataTrainingArguments:
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
+    train_data_dir: Optional[str] = field(
+        default=None, metadata={"help": "The direcotry containing input hdf5 training data files."}
+    )
+    seq_length: int = field(
+        default=-1, metadata={"help": "Sequence length of the inputs."}
+    )
+    vocab_size: int = field(
+        default=-1, metadata={"help": "Vocab size of the inputs."}
+    )
 
 
 def get_dataset(args: DataTrainingArguments, tokenizer: PreTrainedTokenizer, evaluate=False, local_rank=-1):
@@ -197,6 +206,12 @@ def main():
             "and load it from here, using --tokenizer_name"
         )
 
+    if data_args.seq_length != -1:
+        config.n_ctx = data_args.seq_length
+        config.n_positions = data_args.seq_length
+    if data_args.vocab_size != -1:
+        config.vocab_size = data_args.vocab_size
+
     if model_args.model_name_or_path:
         model = AutoModelWithLMHead.from_pretrained(
             model_args.model_name_or_path,
@@ -208,7 +223,7 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelWithLMHead.from_config(config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(data_args.vocab_size if data_args.vocab_size != -1 else len(tokenizer))
 
     if config.model_type in ["bert", "roberta", "distilbert", "camembert"] and not data_args.mlm:
         raise ValueError(
@@ -225,7 +240,7 @@ def main():
     # Get datasets
     train_dataset = (
         get_dataset(data_args, tokenizer=tokenizer, local_rank=training_args.local_rank)
-        if training_args.do_train
+        if training_args.do_train and data_args.train_data_file is not None
         else None
     )
     eval_dataset = (
@@ -236,6 +251,9 @@ def main():
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer, mlm=data_args.mlm, mlm_probability=data_args.mlm_probability
     )
+
+    if data_args.train_data_dir is not None:
+        training_args.train_data_dir = data_args.train_data_dir
 
     trainer = OrtTrainer if training_args.ort_trainer else Trainer
     # Initialize our Trainer
