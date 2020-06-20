@@ -232,7 +232,7 @@ class OrtTrainer:
         model = ORTTrainer(model, None, model_desc, "AdamOptimizer",
             map_optimizer_attributes,
             learning_rate_description,
-            args.device, postprocess_model=transform_gpt2, 
+            args.device, 
             gradient_accumulation_steps=args.gradient_accumulation_steps, 
             # BertLAMB default initial settings: b1=0.9, b2=0.999, e=1e-6
             world_rank = self.args.world_rank,
@@ -241,8 +241,9 @@ class OrtTrainer:
             allreduce_post_accumulation = True,
             _opset_version=11,
             frozen_weights = frozen_weights,
-            )
-            # frozen_weights=['model_.transformer.h.0.attn.bias','model_.transformer.h.0.attn.masked_bias'])
+            _extra_postprocess=transform_gpt2,
+        )
+        # frozen_weights=['model_.transformer.h.0.attn.bias','model_.transformer.h.0.attn.masked_bias'])
         
         logger.info("****************************Model converted to ORT")
         return model
