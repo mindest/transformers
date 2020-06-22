@@ -21,8 +21,10 @@ $RUN_CMD \
     --block_size 1024  \
     --weight_decay 0.01 \
     --overwrite_output_dir \
-    --logging_steps 500 \
+    --logging_steps 5 \
     --logging_first_step True \
+    --logging_dir /bingads/models \
+    --fp16 \
     # --do_eval \
     # --train_data_file=$TRAIN_FILE \
     # --eval_data_file=$TEST_FILE \

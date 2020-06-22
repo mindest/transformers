@@ -90,7 +90,7 @@ class PretrainingDataset(Dataset):
 
 def create_pretraining_dataset(input_file, args, worker_init):
     train_data = PretrainingDataset(input_file=input_file)
-    train_sampler = SequentialSampler(train_data)
+    train_sampler = RandomSampler(train_data)
     train_dataloader = DataLoader(train_data, sampler=train_sampler,
                                   batch_size=args.per_gpu_train_batch_size,
                                   num_workers=4, worker_init_fn=worker_init,
@@ -396,25 +396,27 @@ class OrtTrainer:
 
                     dataset_future = pool.submit(create_pretraining_dataset, data_file, self.args, worker_init)
 
-                    train_iter = tqdm(train_dataloader, desc="Iteration") if self.args.local_rank in [-1, 0] else train_dataloader
+                    train_iter = tqdm(train_dataloader, desc="Iter (loss=X.XXX, lr=0.0)") if self.args.local_rank in [-1, 0] else train_dataloader
 
                     for step, batch in enumerate(train_iter):
                         inputs = {'input_ids': batch[0], 'labels': batch[1]}
                         learning_rate = torch.tensor([scheduler.get_lr_this_step(global_step, base_lr = self.args.learning_rate)])
                         loss, all_finite = self._training_step(model, inputs, learning_rate, loss_scaler)
                         tr_loss += loss
-                        if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
-                            # last step in epoch but step is always smaller than gradient_accumulation_steps
-                            len(epoch_iterator) <= self.args.gradient_accumulation_steps
-                            and (step + 1) == len(epoch_iterator)
-                            ):
+                        if self.args.local_rank in [-1, 0]:
+                            train_iter.set_description('Iter (loss={:5.3f}, lr={:.6f})'.format(loss, learning_rate.item()))
+                        if (step + 1) % self.args.gradient_accumulation_steps == 0:
+                        # or (
+                        #    # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        #    len(epoch_iterator) <= self.args.gradient_accumulation_steps
+                        #    and (step + 1) == len(epoch_iterator)
+                        #    ):
 
                             if self.args.fp16:
                                 loss_scaler.update_loss_scale(all_finite.item())
 
                             global_step += 1
 
-                            """
                             if self.args.local_rank in [-1, 0]:
                                 if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
                                     global_step == 1 and self.args.logging_first_step
@@ -424,15 +426,17 @@ class OrtTrainer:
                                     logs["learning_rate"] = learning_rate.item()
                                     logs["loss"] = loss_avg
                                     logs["global_step"] = global_step
-                                    logs["global_step_time"] = global_batch_train_duration
+                                    if self.args.fp16:
+                                        logs["loss_scale"] = loss_scaler.loss_scale_
                                     logging_loss = tr_loss
 
                                     if self.tb_writer:
                                         for k, v in logs.items():
                                             self.tb_writer.add_scalar(k, v, global_step)
-                                            run.log(k,v)
-                                    epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
+                                            #run.log(k,v)
+                                    #epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
 
+                                """
                                 if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
                                     # In all cases (even distributed/parallel), self.model is always a reference
                                     # to the model we want to save.
@@ -449,7 +453,7 @@ class OrtTrainer:
                             if global_step >= self.args.max_steps:
                                 del train_dataloader
                                 # thread.join()
-                                return args, final_loss, train_time_raw, global_step
+                                return self.args, loss, global_step
 
                     del train_dataloader
                     # thread.join()
