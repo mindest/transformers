@@ -274,16 +274,34 @@ class Trainer:
         optimizer, scheduler = self.get_optimizers(num_training_steps=t_total)
 
         # Check if saved optimizer or scheduler states exist
-        if (
-            model_path is not None
-            and os.path.isfile(os.path.join(model_path, "optimizer.pt"))
-            and os.path.isfile(os.path.join(model_path, "scheduler.pt"))
-        ):
-            # Load in optimizer and scheduler states
-            optimizer.load_state_dict(torch.load(os.path.join(model_path, "optimizer.pt")))
-            scheduler.load_state_dict(torch.load(os.path.join(model_path, "scheduler.pt")))
+        # if (
+        #     model_path is not None
+        #     and os.path.isfile(os.path.join(model_path, "optimizer.pt"))
+        #     and os.path.isfile(os.path.join(model_path, "scheduler.pt"))
+        # ):
+        #     # Load in optimizer and scheduler states
+        #     optimizer.load_state_dict(torch.load(os.path.join(model_path, "optimizer.pt")))
+        #     scheduler.load_state_dict(torch.load(os.path.join(model_path, "scheduler.pt")))
 
         model = self.model
+        model.to(self.args.device)
+        if self.args.fp16:
+            if not is_apex_available():
+                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+            model, optimizer = amp.initialize(model, optimizer, opt_level=self.args.fp16_opt_level)
+
+        # multi-gpu training (should be after apex fp16 initialization)
+        if self.args.n_gpu > 1:
+            model = torch.nn.DataParallel(model)
+
+        # Distributed training (should be after apex fp16 initialization)
+        if self.args.local_rank != -1:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[self.args.local_rank],
+                output_device=self.args.local_rank,
+                find_unused_parameters=True,
+            )
 
         if self.tb_writer is not None:
             self.tb_writer.add_text("args", self.args.to_json_string())
