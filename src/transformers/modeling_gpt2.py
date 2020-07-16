@@ -146,7 +146,7 @@ class Attention(nn.Module):
             w = w / math.sqrt(v.size(-1))
         nd, ns = w.size(-2), w.size(-1)
         mask = self.bias.to(torch.bool)
-        w = torch.where(mask, w, self.masked_bias)
+        w = torch.where(mask, w, self.masked_bias.to(w.dtype))
 
         if attention_mask is not None:
             # Apply the attention mask
