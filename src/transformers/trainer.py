@@ -4,6 +4,7 @@ import os
 import random
 import re
 import shutil
+import h5py
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
@@ -21,7 +22,10 @@ from tqdm import tqdm, trange
 from .data.data_collator import DataCollator, DefaultDataCollator
 from .modeling_utils import PreTrainedModel
 from .optimization import AdamW, get_linear_schedule_with_warmup
+from .optimization_ort import linear_schedule_with_warmup
+# from .trainer_ort import WorkerInitObj, PretrainingDataset, create_pretraining_dataset
 from .training_args import TrainingArguments
+from concurrent.futures import ProcessPoolExecutor
 
 
 try:
@@ -51,6 +55,40 @@ except ImportError:
 
 def is_tensorboard_available():
     return _has_tensorboard
+
+
+class WorkerInitObj(object):
+    def __init__(self, seed):
+        self.seed = seed
+    def __call__(self, id):
+        np.random.seed(seed=self.seed + id)
+        random.seed(self.seed + id)
+
+
+class PretrainingDataset(Dataset):
+    def __init__(self, input_file):
+        self.input_file = input_file
+        f = h5py.File(input_file, "r")
+        self.inputs = np.asarray(f['input_ids'][:])
+        f.close()
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.inputs)
+
+    def __getitem__(self, index):
+        # [input_ids, labels]
+        return [torch.from_numpy(self.inputs[index].astype(np.int64)), torch.from_numpy(self.inputs[index].astype(np.int64))]
+
+
+def create_pretraining_dataset(input_file, args, worker_init):
+    train_data = PretrainingDataset(input_file=input_file)
+    train_sampler = RandomSampler(train_data)
+    train_dataloader = DataLoader(train_data, sampler=train_sampler,
+                                  batch_size=args.per_gpu_train_batch_size,
+                                  num_workers=4, worker_init_fn=worker_init,
+                                  pin_memory=True)
+    return train_dataloader, input_file
 
 
 logger = logging.getLogger(__name__)
@@ -202,6 +240,8 @@ class Trainer:
             },
         ]
         optimizer = AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+        # scheduler = linear_schedule_with_warmup(num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
+        # )
         scheduler = get_linear_schedule_with_warmup(
             optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
         )
@@ -216,28 +256,32 @@ class Trainer:
                 (Optional) Local path to model if model to train has been instantiated from a local path
                 If present, we will try reloading the optimizer/scheduler states from there.
         """
-        train_dataloader = self.get_train_dataloader()
-
-        if self.args.max_steps > 0:
-            t_total = self.args.max_steps
-            num_train_epochs = (
-                self.args.max_steps // (len(train_dataloader) // self.args.gradient_accumulation_steps) + 1
-            )
+        train_dataloader = None
+        if self.args.train_data_dir is None:
+            self.get_train_dataloader()
+            if self.args.max_steps > 0:
+                t_total = self.args.max_steps
+                num_train_epochs = (
+                    self.args.max_steps // (len(train_dataloader) // self.args.gradient_accumulation_steps) + 1
+                )
+            else:
+                t_total = int(len(train_dataloader) // self.args.gradient_accumulation_steps * self.args.num_train_epochs)
+                num_train_epochs = self.args.num_train_epochs
         else:
-            t_total = int(len(train_dataloader) // self.args.gradient_accumulation_steps * self.args.num_train_epochs)
-            num_train_epochs = self.args.num_train_epochs
+            assert self.args.max_steps > 0
+            t_total = self.args.max_steps
 
         optimizer, scheduler = self.get_optimizers(num_training_steps=t_total)
 
         # Check if saved optimizer or scheduler states exist
-        if (
-            model_path is not None
-            and os.path.isfile(os.path.join(model_path, "optimizer.pt"))
-            and os.path.isfile(os.path.join(model_path, "scheduler.pt"))
-        ):
-            # Load in optimizer and scheduler states
-            optimizer.load_state_dict(torch.load(os.path.join(model_path, "optimizer.pt")))
-            scheduler.load_state_dict(torch.load(os.path.join(model_path, "scheduler.pt")))
+        # if (
+        #     model_path is not None
+        #     and os.path.isfile(os.path.join(model_path, "optimizer.pt"))
+        #     and os.path.isfile(os.path.join(model_path, "scheduler.pt"))
+        # ):
+        #     # Load in optimizer and scheduler states
+        #     optimizer.load_state_dict(torch.load(os.path.join(model_path, "optimizer.pt")))
+        #     scheduler.load_state_dict(torch.load(os.path.join(model_path, "scheduler.pt")))
 
         model = self.model
         model.to(self.args.device)
@@ -264,8 +308,8 @@ class Trainer:
 
         # Train!
         logger.info("***** Running training *****")
-        logger.info("  Num examples = %d", len(train_dataloader.dataset))
-        logger.info("  Num Epochs = %d", num_train_epochs)
+        # logger.info("  Num examples = %d", len(train_dataloader.dataset))
+        # logger.info("  Num Epochs = %d", num_train_epochs)
         logger.info("  Instantaneous batch size per GPU = %d", self.args.per_gpu_train_batch_size)
         logger.info(
             "  Total train batch size (w. parallel, distributed & accumulation) = %d",
@@ -300,82 +344,190 @@ class Trainer:
         tr_loss = 0.0
         logging_loss = 0.0
         model.zero_grad()
-        train_iterator = trange(
-            epochs_trained, int(num_train_epochs), desc="Epoch", disable=self.args.local_rank not in [-1, 0],
-        )
-        for epoch in train_iterator:
-            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=self.args.local_rank not in [-1, 0])
-            for step, inputs in enumerate(epoch_iterator):
+        global_batch_train_start = 0
+        epoch = 0
 
-                # Skip past any already trained steps if resuming training
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    continue
+        if self.args.train_data_dir is not None:
+            worker_init = WorkerInitObj(self.args.seed + self.args.local_rank)
+            pool = ProcessPoolExecutor(1)
+            while True:
+                files = [os.path.join(self.args.train_data_dir, f) for f in os.listdir(self.args.train_data_dir) if os.path.isfile(os.path.join(self.args.train_data_dir, f))]
+                files.sort()
+                num_files = len(files)
+                random.Random(self.args.seed + epoch).shuffle(files)
+                f_start_id = 0
 
-                tr_loss += self._training_step(model, inputs, optimizer)
+                if self.args.world_size > num_files:
+                    remainder = self.args.world_size % num_files
+                    data_file = files[(f_start_id*self.args.world_size+self.args.world_rank + remainder*f_start_id)%num_files]
+                else:
+                    data_file = files[(f_start_id*self.args.world_size+self.args.world_rank)%num_files]
 
-                if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    len(epoch_iterator) <= self.args.gradient_accumulation_steps
-                    and (step + 1) == len(epoch_iterator)
-                ):
-                    if self.args.fp16:
-                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), self.args.max_grad_norm)
+                previous_file = data_file
+                train_data = PretrainingDataset(data_file)
+                train_sampler = RandomSampler(train_data)
+                train_dataloader = DataLoader(train_data, sampler=train_sampler,
+                                              batch_size=self.args.per_gpu_train_batch_size,
+                                              num_workers=4, worker_init_fn=worker_init,
+                                              pin_memory=True)
+
+                for f_id in range(f_start_id + 1, len(files)):
+                    if self.args.world_size > num_files:
+                        data_file = files[(f_id*self.args.world_size+self.args.world_rank + remainder*f_id)%num_files]
                     else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                        data_file = files[(f_id*self.args.world_size+self.args.world_rank)%num_files]
 
-                    optimizer.step()
-                    scheduler.step()
-                    model.zero_grad()
-                    global_step += 1
+                    previous_file = data_file
 
-                    if self.args.local_rank in [-1, 0]:
-                        if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
-                            global_step == 1 and self.args.logging_first_step
-                        ):
-                            logs = {}
-                            if self.args.evaluate_during_training:
-                                results = self.evaluate()
-                                for key, value in results.items():
-                                    eval_key = "eval_{}".format(key)
-                                    logs[eval_key] = value
+                    dataset_future = pool.submit(create_pretraining_dataset, data_file, self.args, worker_init)
 
-                            loss_scalar = (tr_loss - logging_loss) / self.args.logging_steps
-                            learning_rate_scalar = (
-                                scheduler.get_last_lr()[0]
-                                if version.parse(torch.__version__) >= version.parse("1.4")
-                                else scheduler.get_lr()[0]
-                                )
-                            logs["learning_rate"] = learning_rate_scalar
-                            logs["loss"] = loss_scalar
-                            logging_loss = tr_loss
+                    train_iter = tqdm(train_dataloader, desc="Iter (loss=X.XXX, lr=0.0)") if self.args.local_rank in [-1, 0] else train_dataloader
 
-                            if self.tb_writer:
-                                for k, v in logs.items():
-                                    self.tb_writer.add_scalar(k, v, global_step)
-                            epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
+                    for step, batch in enumerate(train_iter):
+                        inputs = {'input_ids': batch[0], 'labels': batch[1]}
+                        # learning_rate = torch.tensor([scheduler.get_lr_this_step(global_step, base_lr = self.args.learning_rate)])
+                        learning_rate = scheduler.get_last_lr()[0]
+                        loss = self._training_step(model, inputs, optimizer)
+                        tr_loss += loss
+                        if self.args.local_rank in [-1, 0]:
+                            train_iter.set_description('Iter (loss={:5.3f}, lr={:.6f})'.format(loss, learning_rate))
+                        if (step + 1) % self.args.gradient_accumulation_steps == 0:
+                        # or (
+                        #    # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        #    len(epoch_iterator) <= self.args.gradient_accumulation_steps
+                        #    and (step + 1) == len(epoch_iterator)
+                        #    ):
 
-                        if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
-                            # In all cases (even distributed/parallel), self.model is always a reference
-                            # to the model we want to save.
-                            if hasattr(model, "module"):
-                                assert model.module is self.model
-                            else:
-                                assert model is self.model
-                            # Save model checkpoint
-                            output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
-                            self.save_model(output_dir)
-                            self._rotate_checkpoints()
-                            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                            torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                            logger.info("Saving optimizer and scheduler states to %s", output_dir)
+                            # if self.args.fp16:
+                            #     loss_scaler.update_loss_scale(all_finite.item())
 
+                            optimizer.step()
+                            scheduler.step()
+                            model.zero_grad()
+                            global_step += 1
+
+                            if self.args.local_rank in [-1, 0]:
+                                if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
+                                    global_step == 1 and self.args.logging_first_step
+                                ):
+                                    logs = {}
+                                    loss_avg = (tr_loss - logging_loss) / (self.args.logging_steps * self.args.gradient_accumulation_steps)
+                                    logs["learning_rate"] = learning_rate
+                                    logs["loss"] = loss_avg
+                                    logs["global_step"] = global_step
+                                    # if self.args.fp16:
+                                    #     logs["loss_scale"] = loss_scaler.loss_scale_
+                                    logging_loss = tr_loss
+
+                                    if self.tb_writer:
+                                        for k, v in logs.items():
+                                            self.tb_writer.add_scalar(k, v, global_step)
+                                            #run.log(k,v)
+                                    #epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
+
+                                """
+                                if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
+                                    # In all cases (even distributed/parallel), self.model is always a reference
+                                    # to the model we want to save.
+                                    if hasattr(model, "module"):
+                                        assert model.module is self.ort_model
+                                    else:
+                                        assert model is self.ort_model
+                                    # Save model checkpoint
+                                    output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
+                                    self.save_model(output_dir)
+                                    # self._rotate_checkpoints()
+                                """
+
+                            if global_step >= self.args.max_steps:
+                                del train_dataloader
+                                # thread.join()
+                                return self.args, loss, global_step
+
+                    del train_dataloader
+                    # thread.join()
+                    # Make sure pool has finished and switch train_dataloader
+                    # NOTE: Will block until complete
+                    train_dataloader, data_file = dataset_future.result(timeout=None)
+
+                epoch += 1
+        else:
+            train_iterator = trange(
+                epochs_trained, int(num_train_epochs), desc="Epoch", disable=self.args.local_rank not in [-1, 0],
+            )
+            for epoch in train_iterator:
+                epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=self.args.local_rank not in [-1, 0])
+                for step, inputs in enumerate(epoch_iterator):
+
+                    # Skip past any already trained steps if resuming training
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        continue
+
+                    tr_loss += self._training_step(model, inputs, optimizer)
+
+                    if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
+                        # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        len(epoch_iterator) <= self.args.gradient_accumulation_steps
+                        and (step + 1) == len(epoch_iterator)
+                    ):
+                        if self.args.fp16:
+                            torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), self.args.max_grad_norm)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+
+                        optimizer.step()
+                        scheduler.step()
+                        model.zero_grad()
+                        global_step += 1
+
+                        if self.args.local_rank in [-1, 0]:
+                            if (self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0) or (
+                                global_step == 1 and self.args.logging_first_step
+                            ):
+                                logs = {}
+                                if self.args.evaluate_during_training:
+                                    results = self.evaluate()
+                                    for key, value in results.items():
+                                        eval_key = "eval_{}".format(key)
+                                        logs[eval_key] = value
+
+                                loss_scalar = (tr_loss - logging_loss) / self.args.logging_steps
+                                learning_rate_scalar = (
+                                    scheduler.get_last_lr()[0]
+                                    if version.parse(torch.__version__) >= version.parse("1.4")
+                                    else scheduler.get_lr()[0]
+                                    )
+                                logs["learning_rate"] = learning_rate_scalar
+                                logs["loss"] = loss_scalar
+                                logging_loss = tr_loss
+
+                                if self.tb_writer:
+                                    for k, v in logs.items():
+                                        self.tb_writer.add_scalar(k, v, global_step)
+                                epoch_iterator.write(json.dumps({**logs, **{"step": global_step}}))
+
+                            if self.args.save_steps > 0 and global_step % self.args.save_steps == 0:
+                                # In all cases (even distributed/parallel), self.model is always a reference
+                                # to the model we want to save.
+                                if hasattr(model, "module"):
+                                    assert model.module is self.model
+                                else:
+                                    assert model is self.model
+                                # Save model checkpoint
+                                output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
+                                self.save_model(output_dir)
+                                self._rotate_checkpoints()
+                                torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                                torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                                logger.info("Saving optimizer and scheduler states to %s", output_dir)
+
+                    if self.args.max_steps > 0 and global_step > self.args.max_steps:
+                        epoch_iterator.close()
+                        break
                 if self.args.max_steps > 0 and global_step > self.args.max_steps:
-                    epoch_iterator.close()
+                    train_iterator.close()
                     break
-            if self.args.max_steps > 0 and global_step > self.args.max_steps:
-                train_iterator.close()
-                break
 
         if self.tb_writer:
             self.tb_writer.close()

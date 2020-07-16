@@ -159,7 +159,7 @@ class OrtTrainer:
         # Create output directory if needed
         if self.is_world_master():
             os.makedirs(self.args.output_dir, exist_ok=True)
-        
+
         torch.cuda.set_device(self.args.local_rank)
 
         self.ort_model = self.to_ort_model(model, model.config, args)
@@ -170,7 +170,7 @@ class OrtTrainer:
                 "Updating weights of torch model from ORT model."
             )
             ort_state_dict = self.ort_model.state_dict()
-            torch_state_dict = dict((key.split('model_.')[1], value) for key, value in ort_state_dict.items())
+            torch_state_dict = dict((key, value) for key, value in ort_state_dict.items())
             self.model.load_state_dict(torch_state_dict, strict=False)
         else:
             logger.warning(
@@ -178,18 +178,18 @@ class OrtTrainer:
             )
 
     def gpt2_model_description(self,n_head, vocab_size, n_hidden, n_layer, n_ctx, batch_size):
-    
+
         logger.info("****num of head is: {}".format(n_head))
         logger.info("****vocab size is: {}".format(vocab_size))
         logger.info("****num of hidden layer is: {}".format(n_hidden))
         logger.info("****num of layer is: {}".format(n_layer))
         logger.info("****seq length is: {}".format(n_ctx))
 
-        input_ids_desc = IODescription('input_ids', [batch_size, n_ctx], torch.int64, num_classes = vocab_size)    
+        input_ids_desc = IODescription('input_ids', [batch_size, n_ctx], torch.int64, num_classes = vocab_size)
         labels_desc = IODescription('labels', [batch_size, n_ctx], torch.int64, num_classes = vocab_size)
-        
+
         loss_desc = IODescription('loss', [], torch.float32)
-        
+
         return ModelDescription([input_ids_desc, labels_desc],
                                 [loss_desc])
 
@@ -232,8 +232,8 @@ class OrtTrainer:
         model = ORTTrainer(model, None, model_desc, "AdamOptimizer",
             map_optimizer_attributes,
             learning_rate_description,
-            args.device, 
-            gradient_accumulation_steps=args.gradient_accumulation_steps, 
+            args.device,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             # BertLAMB default initial settings: b1=0.9, b2=0.999, e=1e-6
             world_rank = self.args.world_rank,
             world_size = self.args.world_size,
@@ -244,7 +244,7 @@ class OrtTrainer:
             _extra_postprocess=transform_gpt2,
         )
         # frozen_weights=['model_.transformer.h.0.attn.bias','model_.transformer.h.0.attn.masked_bias'])
-        
+
         logger.info("****************************Model converted to ORT")
         return model
 
@@ -474,7 +474,7 @@ class OrtTrainer:
                     if steps_trained_in_current_epoch > 0:
                         steps_trained_in_current_epoch -= 1
                         continue
-                    
+
                     learning_rate = torch.tensor([scheduler.get_lr_this_step(global_step, base_lr = self.args.learning_rate)])
                     loss, all_finite = self._training_step(model, inputs, learning_rate, loss_scaler)
                     tr_loss += loss
@@ -520,7 +520,7 @@ class OrtTrainer:
                                 output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{global_step}")
                                 self.save_model(output_dir)
                                 # self._rotate_checkpoints()
-                                
+
                     if self.args.max_steps > 0 and global_step > self.args.max_steps:
                         epoch_iterator.close()
                         break
@@ -533,7 +533,7 @@ class OrtTrainer:
         self.update_torch_model()
         del(self.ort_model)
         self.ort_model = None
-        
+
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(global_step, tr_loss / global_step)
 
@@ -550,7 +550,7 @@ class OrtTrainer:
             result = model(inputs['input_ids'],inputs['labels'], learning_rate, loss_scale)
         else:
             result = model(inputs['input_ids'],inputs['labels'], learning_rate)
-        
+
         all_finite = None
         if isinstance(result, (list, tuple)):
             loss = result[0]
@@ -672,7 +672,7 @@ class OrtTrainer:
             model = torch.nn.DataParallel(self.model)
         else:
             model = self.model
-        
+
         model.to(self.args.device)
         if self.is_world_master():
             logger.info("***** Running %s *****", description)
