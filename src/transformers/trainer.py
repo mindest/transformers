@@ -411,7 +411,7 @@ class Trainer:
                                     global_step == 1 and self.args.logging_first_step
                                 ):
                                     logs = {}
-                                    loss_avg = (tr_loss - logging_loss) / (self.args.logging_steps * self.args.gradient_accumulation_steps)
+                                    loss_avg = (tr_loss - logging_loss) / self.args.logging_steps
                                     logs["learning_rate"] = learning_rate
                                     logs["loss"] = loss_avg
                                     logs["global_step"] = global_step
